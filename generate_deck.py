@@ -12,6 +12,8 @@ import time
 
 from google import genai
 from google.genai import types
+from pptx import Presentation
+from pptx.util import Emu
 
 
 PARTITION_MODEL = "gemini-2.5-flash-lite"
@@ -38,6 +40,8 @@ Return a JSON array of objects with these fields:
 - slide_number (int): 1-indexed position in the deck (counting all slides, including those without visuals)
 - title (string): the slide heading text
 - prompt (string): the complete image generation prompt
+- speaker_notes (string or null): the text after "**SPEAKING NOTES:**" on the slide, if present. \
+Include the full text of the speaking notes, cleaned up (no markdown bold markers). Null if no speaking notes.
 
 Only include slides that have a VISUAL directive. Skip slides without one.
 
@@ -60,7 +64,19 @@ def log(msg, prefix="INFO"):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate slide deck images from a markdown file using Gemini."
+        description="Generate slide deck images from a markdown file using Gemini.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  %(prog)s deck.md --all                        Generate all slides at 512px
+  %(prog)s deck.md --all -r 2k -o ./slides      Generate all at 2K into ./slides
+  %(prog)s deck.md --slides 3,5,6,10            Regenerate only slides 3, 5, 6, 10
+  %(prog)s deck.md --slides 1,2 -r 4k -p 10    Slides 1 & 2 at 4K, 10 workers
+
+environment:
+  GEMINI_API_KEY    Required. Your Google Gemini API key.
+                    Get one at https://aistudio.google.com/apikey
+""",
     )
     parser.add_argument("deck_file", help="Path to the markdown deck file")
     parser.add_argument(
@@ -77,8 +93,8 @@ def parse_args():
         "-p",
         "--max-parallel",
         type=int,
-        default=5,
-        help="Max concurrent image generations (default: 5)",
+        default=20,
+        help="Max concurrent image generations (default: 20)",
     )
 
     # Slide selection: must specify --all or --slides
@@ -190,7 +206,7 @@ def generate_slide_image(client, slide, resolution, output_dir):
     ]
 
     config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_level="MINIMAL"),
+        thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
         response_modalities=["IMAGE", "TEXT"],
     )
 
@@ -247,6 +263,47 @@ def generate_slide_image(client, slide, resolution, output_dir):
         log(f"Model returned text only: {full_text[:200]}...", tag)
 
     raise RuntimeError(f"No image generated for slide {slide_num}: {slide_title}")
+
+
+def build_pptx(slides, output_dir, pptx_path):
+    """Assemble generated slide images into a PowerPoint file with speaker notes."""
+    prs = Presentation()
+    # Set 16:9 slide dimensions (standard widescreen)
+    prs.slide_width = Emu(12192000)   # 13.333 inches
+    prs.slide_height = Emu(6858000)   # 7.5 inches
+
+    blank_layout = prs.slide_layouts[6]  # blank layout
+
+    for slide_data in sorted(slides, key=lambda s: s["slide_number"]):
+        slide_num = slide_data["slide_number"]
+        # Find the generated image file
+        image_path = None
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            candidate = os.path.join(output_dir, f"slide_{slide_num:02d}{ext}")
+            if os.path.exists(candidate):
+                image_path = candidate
+                break
+
+        if not image_path:
+            log(f"No image found for slide {slide_num}, skipping", "PPTX")
+            continue
+
+        pptx_slide = prs.slides.add_slide(blank_layout)
+        # Add image covering the full slide
+        pptx_slide.shapes.add_picture(
+            image_path, Emu(0), Emu(0),
+            width=prs.slide_width, height=prs.slide_height,
+        )
+
+        # Add speaker notes if available
+        notes = slide_data.get("speaker_notes")
+        if notes:
+            notes_slide = pptx_slide.notes_slide
+            notes_slide.notes_text_frame.text = notes
+
+    prs.save(pptx_path)
+    log(f"PowerPoint saved: {pptx_path}", "PPTX")
+    return pptx_path
 
 
 def generate_all_slides(client, slides, resolution, output_dir, max_parallel):
@@ -347,7 +404,15 @@ def main():
     results = generate_all_slides(client, slides, args.resolution, args.output, args.max_parallel)
 
     log("=" * 60, "MAIN")
+    log("PHASE 3: ASSEMBLING POWERPOINT", "MAIN")
+    log("=" * 60, "MAIN")
+    deck_name = os.path.splitext(os.path.basename(args.deck_file))[0]
+    pptx_path = os.path.join(args.output, f"{deck_name}.pptx")
+    build_pptx(slides, args.output, pptx_path)
+
+    log("=" * 60, "MAIN")
     log(f"DONE: {len(results)}/{len(slides)} images saved to {args.output}/", "MAIN")
+    log(f"      PowerPoint: {pptx_path}", "MAIN")
     log("=" * 60, "MAIN")
 
 

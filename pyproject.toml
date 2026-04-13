@@ -1,0 +1,15 @@
+[project]
+name = "generate-deck"
+version = "0.1.0"
+description = "Generate visual slide deck images from a markdown deck file using Gemini"
+requires-python = ">=3.10"
+dependencies = [
+    "google-genai",
+    "python-pptx",
+]
+
+[tool.setuptools]
+py-modules = ["generate_deck"]
+
+[project.scripts]
+generate-deck = "generate_deck:main"

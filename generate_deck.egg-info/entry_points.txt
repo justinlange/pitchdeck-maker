@@ -1,0 +1,2 @@
+[console_scripts]
+generate-deck = generate_deck:main

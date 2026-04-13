@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -c \"from pptx import Presentation; print\\('ok'\\)\")",
+      "Bash(python3:*)",
+      "Bash(pip3 show:*)",
+      "Bash(pip3 list:*)",
+      "Read(//opt/homebrew/bin/**)",
+      "Read(//Users/justinelange/Library/Python/**)",
+      "Read(//Users/justinelange/**)",
+      "Read(//Users/justinelange/.local/bin/**)",
+      "Read(//Users/justinelange/bin/**)",
+      "Bash(generate-deck --help)"
+    ]
+  }
+}

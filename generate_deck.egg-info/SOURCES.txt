@@ -1,0 +1,8 @@
+generate_deck.py
+pyproject.toml
+generate_deck.egg-info/PKG-INFO
+generate_deck.egg-info/SOURCES.txt
+generate_deck.egg-info/dependency_links.txt
+generate_deck.egg-info/entry_points.txt
+generate_deck.egg-info/requires.txt
+generate_deck.egg-info/top_level.txt
