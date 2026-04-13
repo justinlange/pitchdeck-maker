@@ -12,7 +12,8 @@
       "Read(//Users/justinelange/**)",
       "Read(//Users/justinelange/.local/bin/**)",
       "Read(//Users/justinelange/bin/**)",
-      "Bash(generate-deck --help)"
+      "Bash(generate-deck --help)",
+      "Bash(grep -E \"\\\\.\\(ts|js|json|md|py|sh|txt\\)$\")"
     ]
   }
 }

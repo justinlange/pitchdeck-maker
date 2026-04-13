@@ -1,2 +1,4 @@
 google-genai
 python-pptx
+pyobjc-framework-Vision
+pyobjc-framework-Quartz
