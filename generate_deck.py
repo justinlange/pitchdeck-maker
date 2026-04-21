@@ -6,9 +6,11 @@ import concurrent.futures
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
 from google import genai
 from google.genai import types
@@ -694,6 +696,65 @@ def build_ocr_markdown(slides, output_dir, markdown_path):
     return markdown_path
 
 
+# ── PDF ──────────────────────────────────────────────────────────────────────
+
+def build_pdf(slides, output_dir, pdf_path):
+    """Create a PDF from generated slide images using Pillow."""
+    from PIL import Image
+
+    images = []
+    for slide_data in sorted(slides, key=lambda s: s["slide_number"]):
+        slide_num = slide_data["slide_number"]
+        image_path = None
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            candidate = os.path.join(output_dir, f"slide_{slide_num:02d}{ext}")
+            if os.path.exists(candidate):
+                image_path = candidate
+                break
+        if not image_path:
+            log(f"  {YELLOW}⚠ No image for slide {slide_num}, skipping{RESET}", "PDF", YELLOW)
+            continue
+        img = Image.open(image_path).convert("RGB")
+        images.append(img)
+
+    if not images:
+        log(f"{RED}✗ No images found for PDF{RESET}", "PDF", RED)
+        return None
+
+    images[0].save(pdf_path, save_all=True, append_images=images[1:], resolution=150)
+    size = format_size(os.path.getsize(pdf_path))
+    log(f"{GREEN}✓ PDF saved{RESET}  {pdf_path}  ({len(images)} slides, {size})", "PDF", GREEN)
+    return pdf_path
+
+
+def compress_pdf(input_path, output_path):
+    """Compress a PDF using Ghostscript."""
+    try:
+        subprocess.run(
+            [
+                "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+                "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                f"-sOutputFile={output_path}", input_path,
+            ],
+            check=True, capture_output=True,
+        )
+        original = os.path.getsize(input_path)
+        compressed = os.path.getsize(output_path)
+        ratio = (1 - compressed / original) * 100 if original > 0 else 0
+        log(
+            f"{GREEN}✓ Compressed PDF saved{RESET}  {output_path}  "
+            f"({format_size(compressed)}, {ratio:.0f}% smaller)",
+            "PDF", GREEN,
+        )
+        return output_path
+    except FileNotFoundError:
+        log(f"{YELLOW}⚠ Ghostscript (gs) not found — skipping PDF compression{RESET}", "PDF", YELLOW)
+        return None
+    except subprocess.CalledProcessError as e:
+        log(f"{RED}✗ PDF compression failed: {e}{RESET}", "PDF", RED)
+        return None
+
+
 # ── Parallel generation ──────────────────────────────────────────────────────
 
 def generate_all_slides(client, slides, resolution, output_dir, max_parallel, permutations=1):
@@ -855,24 +916,38 @@ def main():
         else:
             slides = all_slides
 
+    # ── Create timestamped batch folder ──
+    deck_name = os.path.splitext(os.path.basename(args.deck_file))[0]
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    batch_dir = os.path.join(args.output, f"{deck_name}_{timestamp}")
+    os.makedirs(batch_dir, exist_ok=True)
+    log(f"  {GREEN}✓ Batch folder{RESET}  {batch_dir}", "MAIN", GREEN)
+
     # ── Phase 2: Generate ──
     log_header("Phase 2: Generating Images")
     results, gen_cost, per_slide_costs = generate_all_slides(
-        client, slides, args.resolution, args.output, args.max_parallel, args.permutations
+        client, slides, args.resolution, batch_dir, args.max_parallel, args.permutations
     )
 
     # ── Phase 3: PowerPoint ──
     if not args.onesheet:
         log_header("Phase 3: Assembling PowerPoint")
-        deck_name = os.path.splitext(os.path.basename(args.deck_file))[0]
-        pptx_path = os.path.join(args.output, f"{deck_name}.pptx")
-        build_pptx(slides, args.output, pptx_path)
+        pptx_path = os.path.join(batch_dir, f"{deck_name}.pptx")
+        build_pptx(slides, batch_dir, pptx_path)
 
-    # ── Phase 4: OCR ──
-    deck_name = os.path.splitext(os.path.basename(args.deck_file))[0]
-    log_header("Phase 4: OCR Slide Images")
-    ocr_md_path = os.path.join(args.output, f"{deck_name}_ocr.md")
-    build_ocr_markdown(slides, args.output, ocr_md_path)
+    # ── Phase 4: PDF ──
+    if not args.onesheet:
+        log_header("Phase 4: Creating PDF")
+        pdf_path = os.path.join(batch_dir, f"{deck_name}.pdf")
+        build_pdf(slides, batch_dir, pdf_path)
+
+        compressed_pdf_path = os.path.join(batch_dir, f"{deck_name}_compressed.pdf")
+        compress_pdf(pdf_path, compressed_pdf_path)
+
+    # ── Phase 5: OCR ──
+    log_header("Phase 5: OCR Slide Images")
+    ocr_md_path = os.path.join(batch_dir, f"{deck_name}_ocr.md")
+    build_ocr_markdown(slides, batch_dir, ocr_md_path)
 
     # ── Cost summary ──
     total_cost = parse_cost + gen_cost
@@ -896,9 +971,11 @@ def main():
 
     # ── Done ──
     log_header("Done")
-    log(f"  {GREEN}✓{RESET} {BOLD}{len(results)}{RESET} images saved to {args.output}/", "DONE", GREEN)
+    log(f"  {GREEN}✓{RESET} {BOLD}{len(results)}{RESET} images saved to {batch_dir}/", "DONE", GREEN)
     if not args.onesheet:
         log(f"  {GREEN}✓{RESET} PowerPoint: {pptx_path}", "DONE", GREEN)
+        log(f"  {GREEN}✓{RESET} PDF: {pdf_path}", "DONE", GREEN)
+        log(f"  {GREEN}✓{RESET} Compressed PDF: {compressed_pdf_path}", "DONE", GREEN)
     log(f"  {GREEN}✓{RESET} OCR markdown: {ocr_md_path}", "DONE", GREEN)
 
 

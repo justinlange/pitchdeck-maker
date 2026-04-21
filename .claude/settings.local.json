@@ -13,7 +13,12 @@
       "Read(//Users/justinelange/.local/bin/**)",
       "Read(//Users/justinelange/bin/**)",
       "Bash(generate-deck --help)",
-      "Bash(grep -E \"\\\\.\\(ts|js|json|md|py|sh|txt\\)$\")"
+      "Bash(grep -E \"\\\\.\\(ts|js|json|md|py|sh|txt\\)$\")",
+      "WebSearch",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "WebFetch(domain:fal.ai)",
+      "WebFetch(domain:pypi.org)"
     ]
   }
 }
