@@ -20,6 +20,7 @@ from pptx.util import Emu
 
 PARTITION_MODEL = "gemini-2.5-flash-lite"
 IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+FAL_IMAGE_MODEL = "openai/gpt-image-2"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [5, 15, 30]  # seconds to wait before each retry
@@ -28,6 +29,22 @@ RETRY_BACKOFF = [5, 15, 30]  # seconds to wait before each retry
 PRICING = {
     PARTITION_MODEL: {"input": 0.075, "output": 0.30, "thinking": 0.30},
     IMAGE_MODEL: {"input": 0.10, "output": 0.40, "thinking": 0.40, "image_output": 3.90},
+}
+
+# fal gpt-image-2: map CLI --resolution to image_size dict
+# Constraints: both dims multiples of 16, total pixels 655,360–8,294,400, max aspect 3:1
+FAL_RESOLUTION_MAP = {
+    "512": {"width": 1024, "height": 1024},
+    "1k":  {"width": 1024, "height": 1024},
+    "2k":  {"width": 1792, "height": 1024},
+    "4k":  {"width": 1792, "height": 1792},
+}
+
+# Flat per-image price (USD) by quality and "{width}x{height}"
+FAL_PRICING = {
+    "low":    {"1024x1024": 0.01, "1792x1024": 0.01, "1792x1792": 0.02},
+    "medium": {"1024x1024": 0.06, "1792x1024": 0.08, "1792x1792": 0.11},
+    "high":   {"1024x1024": 0.22, "1792x1024": 0.30, "1792x1792": 0.41},
 }
 
 # ── Terminal styling ─────────────────────────────────────────────────────────
@@ -196,18 +213,23 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  %(prog)s deck.md --all                        Generate all slides at 512px
-  %(prog)s deck.md --all -r 2k -o ./slides      Generate all at 2K into ./slides
-  %(prog)s deck.md --slides 3,5,6,10            Regenerate only slides 3, 5, 6, 10
-  %(prog)s deck.md --slides 3+                  Generate slide 3 and all after it
-  %(prog)s deck.md --slides 1,2 -r 4k -w 10    Slides 1 & 2 at 4K, 10 workers
-  %(prog)s deck.md --all -p 3                   Generate 3 variations per slide
-  %(prog)s prompt.md --onesheet                  Generate a single image from prompt
-  %(prog)s prompt.md --onesheet -p 5 -r 2k      5 variations of a single prompt at 2K
+  %(prog)s deck.md --all                              Generate all slides at 512px (Gemini)
+  %(prog)s deck.md --all -r 2k -o ./slides            Generate all at 2K into ./slides
+  %(prog)s deck.md --slides 3,5,6,10                  Regenerate only slides 3, 5, 6, 10
+  %(prog)s deck.md --slides 3+                        Generate slide 3 and all after it
+  %(prog)s deck.md --slides 1,2 -r 4k -w 10          Slides 1 & 2 at 4K, 10 workers
+  %(prog)s deck.md --all -p 3                         Generate 3 variations per slide
+  %(prog)s prompt.md --onesheet                        Generate a single image from prompt
+  %(prog)s prompt.md --onesheet -p 5 -r 2k            5 variations of a single prompt at 2K
+  %(prog)s deck.md --all --mode fal                   Generate all slides via fal gpt-image-2
+  %(prog)s deck.md --all --mode fal --quality high    High-quality fal images
+  %(prog)s prompt.md --onesheet --mode fal -r 2k      Single fal image at 1792×1024
 
 environment:
-  GEMINI_API_KEY    Required. Your Google Gemini API key.
+  GEMINI_API_KEY    Required for Gemini mode and deck parsing.
                     Get one at https://aistudio.google.com/apikey
+  FAL_KEY           Required for fal mode (--mode fal).
+                    Get one at https://fal.ai/dashboard
 """,
     )
     parser.add_argument("deck_file", help="Path to the markdown deck file")
@@ -234,6 +256,18 @@ environment:
         type=int,
         default=1,
         help="Number of variations to generate per slide (default: 1)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["gemini", "fal"],
+        default="gemini",
+        help="Image generation backend (default: gemini)",
+    )
+    parser.add_argument(
+        "--quality",
+        choices=["low", "medium", "high"],
+        default="medium",
+        help="Image quality for fal mode — low/medium/high (default: medium)",
     )
 
     # Slide selection: must specify --all, --slides, or --onesheet
@@ -416,7 +450,7 @@ def is_retryable(exc):
     return False
 
 
-def generate_slide_image(client, slide, resolution, output_dir):
+def generate_slide_image(client, slide, resolution, output_dir, mode="gemini", quality="medium"):
     """Generate a single slide image with automatic retry on transient errors."""
     slide_num = slide["slide_number"]
     slide_title = slide["title"]
@@ -427,6 +461,10 @@ def generate_slide_image(client, slide, resolution, output_dir):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            if mode == "fal":
+                return _generate_slide_image_fal_once(
+                    slide_num, slide_title, prompt, resolution, quality, output_dir, tag, attempt
+                )
             return _generate_slide_image_once(
                 client, slide_num, slide_title, prompt, image_size, output_dir, tag, attempt
             )
@@ -572,6 +610,80 @@ def _generate_slide_image_once(client, slide_num, slide_title, prompt, image_siz
         log(f"{RED}✗ Model returned text only:{RESET} {full_text[:300]}...", tag, RED)
 
     raise RuntimeError(f"No image generated for slide {slide_num}: {slide_title}")
+
+
+def _generate_slide_image_fal_once(slide_num, slide_title, prompt, resolution, quality, output_dir, tag, attempt):
+    """Single attempt at generating a slide image via fal.ai gpt-image-2."""
+    import fal_client
+    import urllib.request
+
+    attempt_label = f" {DIM}(attempt {attempt}/{MAX_RETRIES}){RESET}" if attempt > 1 else ""
+    fal_size = FAL_RESOLUTION_MAP[resolution]
+    size_key = f"{fal_size['width']}x{fal_size['height']}"
+
+    log(
+        f"{CYAN}⬆ Sending to {FAL_IMAGE_MODEL}{RESET}  "
+        f"{len(prompt):,} chars  size={size_key}  quality={quality}{attempt_label}",
+        tag, CYAN,
+    )
+
+    t0 = time.time()
+
+    result = fal_client.subscribe(
+        FAL_IMAGE_MODEL,
+        arguments={
+            "prompt": prompt,
+            "image_size": fal_size,
+            "quality": quality,
+            "num_images": 1,
+            "output_format": "png",
+        },
+    )
+
+    elapsed_gen = time.time() - t0
+
+    images = result.get("images", [])
+    if not images:
+        raise RuntimeError(f"fal returned no images for slide {slide_num}: {slide_title}")
+
+    image_info = images[0]
+    url = image_info["url"]
+    content_type = image_info.get("content_type", "image/png")
+    file_size = image_info.get("file_size", 0)
+
+    dl_bar = progress_bar(1.0, color=GREEN)
+    log(
+        f"  {dl_bar}  {GREEN}⬇ Image ready{RESET}  "
+        f"{format_size(file_size) if file_size else '?'}  "
+        f"{DIM}({content_type}, {format_duration(elapsed_gen)}){RESET}",
+        tag, GREEN,
+    )
+
+    log(f"  {CYAN}⬇ Downloading image...{RESET}", tag, CYAN)
+    t_dl = time.time()
+    with urllib.request.urlopen(url) as response:
+        data = response.read()
+    elapsed_dl = time.time() - t_dl
+
+    ext = mimetypes.guess_extension(content_type) or ".png"
+    saved_path = next_available_path(output_dir, f"slide_{slide_num:02d}", ext)
+    save_binary_file(saved_path, data)
+
+    slide_cost = FAL_PRICING.get(quality, {}).get(size_key, 0.0)
+    elapsed_total = time.time() - t0
+
+    log(
+        f"  {GREEN}💾 Saved{RESET}  {saved_path}  ({format_size(len(data))})",
+        tag, GREEN,
+    )
+    log(
+        f"  {DIM}Size: {size_key}  Quality: {quality}  "
+        f"│  Cost: ${slide_cost:.4f}  │  Time: {format_duration(elapsed_total)} "
+        f"(gen: {format_duration(elapsed_gen)}, dl: {format_duration(elapsed_dl)}){RESET}",
+        tag, WHITE,
+    )
+
+    return saved_path, slide_cost
 
 
 # ── PowerPoint ───────────────────────────────────────────────────────────────
@@ -757,7 +869,7 @@ def compress_pdf(input_path, output_path):
 
 # ── Parallel generation ──────────────────────────────────────────────────────
 
-def generate_all_slides(client, slides, resolution, output_dir, max_parallel, permutations=1):
+def generate_all_slides(client, slides, resolution, output_dir, max_parallel, permutations=1, mode="gemini", quality="medium"):
     """Generate all slide images in parallel. Returns (paths, total_cost, per_slide_costs)."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -784,7 +896,7 @@ def generate_all_slides(client, slides, resolution, output_dir, max_parallel, pe
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {}
         for slide in tasks:
-            f = executor.submit(generate_slide_image, client, slide, resolution, output_dir)
+            f = executor.submit(generate_slide_image, client, slide, resolution, output_dir, mode, quality)
             futures[f] = slide
 
         for future in concurrent.futures.as_completed(futures):
@@ -870,19 +982,36 @@ def main():
     else:
         slides_label = str(sorted(selected_slides))
     log(f"  {BOLD}Slides{RESET}        {slides_label}", "MAIN", WHITE)
+    log(f"  {BOLD}Mode{RESET}          {args.mode}", "MAIN", WHITE)
+    if args.mode == "fal":
+        log(f"  {BOLD}Quality{RESET}       {args.quality}", "MAIN", WHITE)
+
+    image_model_name = FAL_IMAGE_MODEL if args.mode == "fal" else IMAGE_MODEL
+    needs_gemini_for_parse = not args.onesheet
+    needs_gemini = args.mode == "gemini" or needs_gemini_for_parse
 
     if not args.onesheet:
         log(f"  {BOLD}Parse model{RESET}   {PARTITION_MODEL}", "MAIN", WHITE)
-    log(f"  {BOLD}Image model{RESET}   {IMAGE_MODEL}", "MAIN", WHITE)
+    log(f"  {BOLD}Image model{RESET}   {image_model_name}", "MAIN", WHITE)
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        log(f"{RED}✗ GEMINI_API_KEY environment variable is not set!{RESET}", "ERROR", RED)
-        sys.exit(1)
-    log(f"  {GREEN}✓ API key loaded{RESET}  ({len(api_key)} chars)", "MAIN", GREEN)
+    # ── API key validation ──
+    client = None
+    if needs_gemini:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            log(f"{RED}✗ GEMINI_API_KEY environment variable is not set!{RESET}", "ERROR", RED)
+            sys.exit(1)
+        log(f"  {GREEN}✓ GEMINI_API_KEY loaded{RESET}  ({len(api_key)} chars)", "MAIN", GREEN)
+        client = genai.Client(api_key=api_key)
+        log(f"  {GREEN}✓ Gemini client initialized{RESET}", "MAIN", GREEN)
 
-    client = genai.Client(api_key=api_key)
-    log(f"  {GREEN}✓ Gemini client initialized{RESET}", "MAIN", GREEN)
+    if args.mode == "fal":
+        fal_key = os.environ.get("FAL_KEY")
+        if not fal_key:
+            log(f"{RED}✗ FAL_KEY environment variable is not set!{RESET}", "ERROR", RED)
+            log(f"  {DIM}Get a key at https://fal.ai/dashboard{RESET}", "ERROR", RED)
+            sys.exit(1)
+        log(f"  {GREEN}✓ FAL_KEY loaded{RESET}  ({len(fal_key)} chars)", "MAIN", GREEN)
 
     with open(args.deck_file) as f:
         markdown_content = f.read()
@@ -926,7 +1055,8 @@ def main():
     # ── Phase 2: Generate ──
     log_header("Phase 2: Generating Images")
     results, gen_cost, per_slide_costs = generate_all_slides(
-        client, slides, args.resolution, batch_dir, args.max_parallel, args.permutations
+        client, slides, args.resolution, batch_dir, args.max_parallel, args.permutations,
+        mode=args.mode, quality=args.quality,
     )
 
     # ── Phase 3: PowerPoint ──
