@@ -18,7 +18,7 @@ from pptx import Presentation
 from pptx.util import Emu
 
 
-PARTITION_MODEL = "gemini-2.5-flash-lite"
+PARTITION_MODEL = "gemini-3.0-flash-lite"
 IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 FAL_IMAGE_MODEL = "openai/gpt-image-2"
 
